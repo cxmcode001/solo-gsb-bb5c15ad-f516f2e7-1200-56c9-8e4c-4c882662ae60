@@ -9,6 +9,7 @@ from .balancer import (
     Species,
     build_balanced_view,
     build_raw_view,
+    enumerate_variants,
     parse_side,
     solve_reaction,
 )
@@ -26,6 +27,7 @@ STATUS_CODES = {
     "ZERO_COEFFICIENT": 422,
     "INVALID_STOICHIOMETRY": 422,
     "CHARGE_NOT_CONSERVED": 422,
+    "VARIANT_SPACE_TOO_LARGE": 422,
 }
 
 
@@ -192,6 +194,76 @@ def build_balance_payload(
             "difference": charge_left - charge_right,
             "balanced": charge_left == charge_right,
         },
+    }
+
+
+# ------------------------------------------------------------ 变体枚举
+def process_variants(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    max_coefficient: int,
+    limit: int,
+) -> tuple[int, dict[str, Any]]:
+    """枚举多种配平方案，返回 (http_status, payload)。"""
+    try:
+        reactants, products = _parse_all(reactant_texts, product_texts)
+    except BalanceError as exc:
+        return STATUS_CODES[exc.code], {"error": error_payload(
+            exc.code, exc.message, dict(exc.details)
+        )}
+
+    if len(reactants) + len(products) > 100:
+        exc = BalanceError("INVALID_REQUEST", "物种总数不能超过 100")
+        return STATUS_CODES[exc.code], {"error": error_payload(
+            exc.code, exc.message, dict(exc.details)
+        )}
+
+    try:
+        solutions, elements, nullity = enumerate_variants(
+            reactants, products, max_coefficient=max_coefficient
+        )
+    except BalanceError as exc:
+        return STATUS_CODES[exc.code], {"error": error_payload(
+            exc.code, exc.message, dict(exc.details)
+        )}
+
+    total_matched = len(solutions)
+    truncated = total_matched > limit
+    selected = solutions[:limit]
+
+    variants = [
+        _variant_block(reactants, products, solution.coefficients)
+        for solution in selected
+    ]
+    return 200, {
+        "normalized": _normalized_block(reactants, products, None),
+        "max_coefficient": max_coefficient,
+        "count": len(variants),
+        "truncated": truncated,
+        "variants": variants,
+        "elements": list(elements),
+        "nullity": nullity,
+        "degrees_of_freedom": nullity - 1,
+    }
+
+
+def _variant_block(
+    reactants: list[Species],
+    products: list[Species],
+    coefficients: tuple[int, ...],
+) -> dict[str, Any]:
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip((*reactants, *products), coefficients)
+    }
+    return {
+        "coefficients": {
+            "reactants": _species_coefficients(reactants, coefficient_map),
+            "products": _species_coefficients(products, coefficient_map),
+            "vector": list(coefficients),
+        },
+        "total": sum(coefficients),
+        "equation": _equation(reactants, products, coefficient_map),
     }
 
 

@@ -8,16 +8,23 @@
   得到唯一配平；
 * 维数为 0 → 不可能守恒；维数 > 1 → 配平不唯一（自由度 ``d-1``）；
 * 维数为 1 但存在 0 分量或符号不一致 → 该反应无法成立。
+
+当零空间维数 2～4（自由变量不超过 3 个）时，:func:`enumerate_variants`
+枚举所有满足系数上界的互质正整数解，供 ``/balance/variants`` 使用。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import product
 from math import gcd, lcm
 from typing import Iterable
 
 from .parser import ParsedFormula, parse_formula
+
+# 变体枚举允许的最大自由变量数：3 个自由变量 × 上界 30 的枚举量仍然可控。
+MAX_VARIANT_FREE_VARIABLES = 3
 
 
 class BalanceError(Exception):
@@ -81,6 +88,35 @@ def parse_side(texts: Iterable[str], side_name: str) -> tuple[Species, ...]:
     return tuple(formulas)
 
 
+# ---------------------------------------------------------------- 守恒矩阵
+def build_conservation_matrix(
+    reactants: tuple[Species, ...] | list[Species],
+    products: tuple[Species, ...] | list[Species],
+) -> tuple[list[str], list[list[Fraction]]]:
+    """构造元素守恒 + 总电荷守恒矩阵（``A x = 0``，生成物列取负）。
+
+    返回 (元素列表, 矩阵)。电子没有任何元素，因此至少包含电荷行。
+    """
+    species = list(reactants) + list(products)
+    n_cols = len(species)
+    n_reactants = len(reactants)
+    element_set = sorted({el for sp in species for el in sp.formula.composition})
+    matrix: list[list[Fraction]] = []
+    for element in element_set:
+        row = [Fraction(sp.formula.composition.get(element, 0)) for sp in species]
+        # 守恒式（左侧原子数 = 右侧原子数）写成 A x = 0：反应物列取正、
+        # 生成物列取负。物理上成立的正系数解在该约定下整体同号。
+        for j in range(n_reactants, n_cols):
+            row[j] = -row[j]
+        matrix.append(row)
+    # 电荷守恒行
+    charge_row = [Fraction(sp.formula.charge) for sp in species]
+    for j in range(n_reactants, n_cols):
+        charge_row[j] = -charge_row[j]
+    matrix.append(charge_row)
+    return element_set, matrix
+
+
 # ---------------------------------------------------------------- 配平入口
 def solve_reaction(
     reactant_texts: Iterable[str],
@@ -96,26 +132,9 @@ def solve_reaction(
     if len(reactants) + len(products) > 100:
         raise BalanceError("INVALID_REQUEST", "物种总数不能超过 100")
 
+    element_set, matrix = build_conservation_matrix(reactants, products)
     species = reactants + products
-
-    element_set = sorted(
-        {el for sp in species for el in sp.formula.composition}
-    )
-    # 电子没有任何元素，需要确保矩阵至少包含电荷行
     n_cols = len(species)
-    matrix: list[list[Fraction]] = []
-    for element in element_set:
-        row = [Fraction(sp.formula.composition.get(element, 0)) for sp in species]
-        # 守恒式（左侧原子数 = 右侧原子数）写成 A x = 0：反应物列取正、
-        # 生成物列取负。物理上成立的正系数解在该约定下整体同号。
-        for j in range(len(reactants), n_cols):
-            row[j] = -row[j]
-        matrix.append(row)
-    # 电荷守恒行
-    charge_row = [Fraction(sp.formula.charge) for sp in species]
-    for j in range(len(reactants), n_cols):
-        charge_row[j] = -charge_row[j]
-    matrix.append(charge_row)
 
     basis = _null_space(matrix)
 
@@ -202,6 +221,162 @@ def solve_reaction(
     )
 
 
+# ---------------------------------------------------------------- 变体枚举
+@dataclass(frozen=True)
+class VariantSolution:
+    """一个互质正整数配平方案。系数按 reactants + products（规范排序）顺序。"""
+
+    coefficients: tuple[int, ...]
+    total: int
+
+
+def enumerate_variants(
+    reactants: tuple[Species, ...] | list[Species],
+    products: tuple[Species, ...] | list[Species],
+    *,
+    max_coefficient: int,
+) -> tuple[list[VariantSolution], tuple[str, ...], int]:
+    """枚举所有系数在 ``1..max_coefficient`` 内的互质正整数解。
+
+    基于守恒矩阵的 RREF：自由变量（= 零空间维数）不超过
+    :data:`MAX_VARIANT_FREE_VARIABLES` 时，把自由分量直接当作枚举变量，
+    利用 RREF 的参数化精确计算主元分量（整数运算，无浮点误差）。
+
+    返回 (排好序的方案列表, 元素列表, 零空间维数)。
+
+    抛出 :class:`BalanceError`：
+
+    * ``IMPOSSIBLE_BALANCE`` —— 零空间维数为 0；
+    * ``ZERO_COEFFICIENT`` / ``INVALID_STOICHIOMETRY`` —— 维数为 1 但解不合法；
+    * ``VARIANT_SPACE_TOO_LARGE`` —— 自由变量超过 3 个。
+    """
+    elements, matrix = build_conservation_matrix(reactants, products)
+    rref, pivots, free_cols = _rref_detail(matrix)
+    nullity = len(free_cols)
+
+    if nullity == 0:
+        raise BalanceError(
+            "IMPOSSIBLE_BALANCE",
+            "元素或电荷守恒方程无解：该反应在给定反应物与生成物下无法配平",
+            elements=elements,
+        )
+
+    if nullity == 1:
+        solutions = _unique_variant(
+            matrix, max_coefficient, elements,
+            list(reactants) + list(products),
+        )
+        return solutions, tuple(elements), 1
+
+    if nullity > MAX_VARIANT_FREE_VARIABLES:
+        raise BalanceError(
+            "VARIANT_SPACE_TOO_LARGE",
+            f"零空间含有 {nullity} 个自由变量（自由度 {nullity - 1}），"
+            f"超过变体枚举上限 {MAX_VARIANT_FREE_VARIABLES} 个；"
+            "请收窄反应物/生成物范围（如补全电子、H2O、H+ / OH- 等物种）。",
+            nullity=nullity,
+            degrees_of_freedom=nullity - 1,
+            max_free_variables=MAX_VARIANT_FREE_VARIABLES,
+            elements=elements,
+        )
+
+    solutions = _enumerate_nullspace(
+        rref, pivots, free_cols, max_coefficient
+    )
+    return solutions, tuple(elements), nullity
+
+
+def _unique_variant(
+    matrix: list[list[Fraction]],
+    max_coefficient: int,
+    elements: list[str],
+    species: list[Species],
+) -> list[VariantSolution]:
+    """零空间维数为 1：复用与 ``/balance`` 相同的合法性判定。
+
+    合法但最小互质系数超过 ``max_coefficient`` 时返回空列表（上界内无解）。
+    """
+    basis = _null_space(matrix)
+    vec = basis[0]
+    if any(x == 0 for x in vec):
+        zero_species = [
+            species[i].normalized for i, x in enumerate(vec) if x == 0
+        ]
+        raise BalanceError(
+            "ZERO_COEFFICIENT",
+            "守恒解要求部分物种的系数为 0，该反应无法作为一个整体配平；"
+            "请把无关物种从反应式中去掉。",
+            zero_coefficient_species=zero_species,
+            elements=elements,
+        )
+    signs = {1 if x > 0 else -1 for x in vec}
+    if len(signs) != 1:
+        raise BalanceError(
+            "INVALID_STOICHIOMETRY",
+            "守恒解中各物种的系数符号不一致：部分物种必须移到另一侧，"
+            "或该反应在化学上不成立。",
+            elements=elements,
+        )
+    ints = _to_positive_integers(vec)
+    if max(ints) > max_coefficient:
+        return []
+    return [VariantSolution(tuple(ints), sum(ints))]
+
+
+def _enumerate_nullspace(
+    rref: list[list[Fraction]],
+    pivots: list[int],
+    free_cols: list[int],
+    max_coefficient: int,
+) -> list[VariantSolution]:
+    """自由变量 2～3 个时的正整数枚举。
+
+    RREF 参数化：``x_主元 = -rref[row][free] · x_自由``。记所有相关
+    分母的最小公倍数为 ``L``、``b[p,f] = -L·rref[row_p][free_f]``（整数），
+    则 ``x_p = Σ b[p,f]·u_f / L``。自由分量 ``u_f`` 本身在 1..M 内枚举，
+    主元分量必须整除、且落在 1..M，最后整体 gcd=1。
+    """
+    n_cols = len(rref[0]) if rref else 0
+    scale = lcm(
+        *(rref[row_idx][free].denominator
+          for row_idx in range(len(pivots))
+          for free in free_cols)
+    )
+    # b[row_idx][f]：主元行 row_idx 关于第 f 个自由分量的整数系数
+    b = [
+        [int(-scale * rref[row_idx][free]) for free in free_cols]
+        for row_idx in range(len(pivots))
+    ]
+
+    found: list[VariantSolution] = []
+    for u_tuple in product(range(1, max_coefficient + 1), repeat=len(free_cols)):
+        x = [0] * n_cols
+        for f, col in enumerate(free_cols):
+            x[col] = u_tuple[f]
+        ok = True
+        for row_idx, col in enumerate(pivots):
+            num = sum(b[row_idx][f] * u_tuple[f] for f in range(len(free_cols)))
+            if num % scale:
+                ok = False
+                break
+            value = num // scale
+            if not 1 <= value <= max_coefficient:
+                ok = False
+                break
+            x[col] = value
+        if not ok:
+            continue
+        common = 0
+        for value in x:
+            common = gcd(common, value)
+        if common != 1:
+            continue
+        found.append(VariantSolution(tuple(x), sum(x)))
+
+    found.sort(key=lambda sol: (sol.total, sol.coefficients))
+    return found
+
+
 # ---------------------------------------------------------------- 线性代数
 def _rref(matrix: list[list[Fraction]]) -> tuple[list[list[Fraction]], list[int]]:
     """对有理数矩阵做高斯-若尔当消元，返回 (RREF, 主元列)。"""
@@ -229,14 +404,26 @@ def _rref(matrix: list[list[Fraction]]) -> tuple[list[list[Fraction]], list[int]
     return m, pivot_cols
 
 
-def _null_space(matrix: list[list[Fraction]]) -> list[list[Fraction]]:
-    """返回矩阵零空间的一组基（每列对应一个基向量）。"""
+def _rref_detail(
+    matrix: list[list[Fraction]],
+) -> tuple[list[list[Fraction]], list[int], list[int]]:
+    """RREF 并返回 (RREF, 主元列, 自由列)。"""
+    rref, pivots = _rref(matrix)
     if not matrix:
         n = 0
     else:
         n = len(matrix[0])
-    rref, pivots = _rref(matrix)
     free_cols = [c for c in range(n) if c not in pivots]
+    return rref, pivots, free_cols
+
+
+def _null_space(matrix: list[list[Fraction]]) -> list[list[Fraction]]:
+    """返回矩阵零空间的一组基（每列对应一个基向量）。"""
+    rref, pivots, free_cols = _rref_detail(matrix)
+    if not matrix:
+        n = 0
+    else:
+        n = len(matrix[0])
     basis: list[list[Fraction]] = []
     for free in free_cols:
         vec = [Fraction(0) for _ in range(n)]

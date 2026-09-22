@@ -35,6 +35,21 @@ class ReactionRequest(BaseModel):
         return cleaned
 
 
+class VariantsRequest(ReactionRequest):
+    max_coefficient: int = Field(
+        ...,
+        ge=2,
+        le=30,
+        description="允许的最大系数（2～30）；仅返回所有系数都在 1～该值内的方案",
+    )
+    limit: int = Field(
+        ...,
+        ge=1,
+        le=100,
+        description="最多返回的方案数（1～100）；超出时 truncated=true",
+    )
+
+
 class SpeciesCoefficient(BaseModel):
     input: str = Field(description="客户端提交的原始化学式")
     normalized: str = Field(description="规范化后的化学式")
@@ -107,3 +122,23 @@ class AnalyzeResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: dict[str, Any]
+
+
+# ------------------------------------------------------------ 变体枚举
+class VariantItem(BaseModel):
+    coefficients: CoefficientBlock
+    total: int = Field(description="系数总和（排序的第一关键字）")
+    equation: str = Field(description="该方案对应的规范化学方程式")
+
+
+class VariantsResponse(BaseModel):
+    normalized: NormalizedReaction
+    max_coefficient: int = Field(description="本次枚举使用的系数上界")
+    count: int = Field(description="实际返回的方案数")
+    truncated: bool = Field(
+        description="符合条件的方案是否超过 limit（被截断为前 limit 个）"
+    )
+    variants: list[VariantItem]
+    elements: list[str]
+    nullity: int = Field(description="守恒矩阵零空间维数（自由变量数）")
+    degrees_of_freedom: int = Field(description="化学自由度 = 零空间维数 - 1")

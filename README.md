@@ -48,7 +48,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 81 个测试
+pytest          # 101 个测试
 ```
 
 ---
@@ -58,6 +58,7 @@ pytest          # 81 个测试
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/balance` | 配平反应，返回最小正整数系数与电荷守恒结果 |
+| POST | `/api/v1/balance/variants` | 枚举多种互质正整数配平方案（自由变量 ≤ 3） |
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
@@ -111,7 +112,88 @@ curl -X POST http://localhost:8000/api/v1/balance \
   -d '{"reactants":["KMnO4","HCl"],"products":["KCl","MnCl2","Cl2","H2O"]}'
 ```
 
-### 2.2 逐元素差异 `POST /api/v1/analyze`
+### 2.2 枚举多种配平方案 `POST /api/v1/balance/variants`
+
+`/balance` 只处理**唯一配平**的反应；当守恒方程存在多个自由度（如
+`C + O2 -> CO + CO2`）时，可用本接口枚举给定系数上界内的全部互质正整数解。
+
+请求体在 `reactants` / `products` 之外增加：
+
+| 字段 | 范围 | 说明 |
+| --- | --- | --- |
+| `max_coefficient` | 2～30 | 所有系数都必须落在 `1..max_coefficient` |
+| `limit` | 1～100 | 最多返回的方案数；超出时 `truncated=true` |
+
+算法沿用同一个有理数 RREF：当**自由变量（零空间维数）不超过 3 个**时，
+把自由分量作为枚举参数精确计算主元分量，只保留元素与总电荷守恒、系数全正、
+最大公约数为 1 的解；按 **系数总和升序、再按规范化物种顺序的向量字典序** 排序。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/balance/variants \
+  -H 'Content-Type: application/json' \
+  -d '{"reactants":["C","O2"],"products":["CO","CO2"],"max_coefficient":5,"limit":100}'
+```
+
+响应 `200`（节选）：
+
+```json
+{
+  "normalized": {
+    "reactants": ["C", "O2"],
+    "products": ["CO", "CO2"],
+    "equation": "C + O2 -> CO + CO2"
+  },
+  "max_coefficient": 5,
+  "count": 2,
+  "truncated": false,
+  "nullity": 2,
+  "degrees_of_freedom": 1,
+  "elements": ["C", "O"],
+  "variants": [
+    {
+      "coefficients": {
+        "reactants": [
+          {"input": "C", "normalized": "C", "coefficient": 3},
+          {"input": "O2", "normalized": "O2", "coefficient": 2}
+        ],
+        "products": [
+          {"input": "CO", "normalized": "CO", "coefficient": 2},
+          {"input": "CO2", "normalized": "CO2", "coefficient": 1}
+        ],
+        "vector": [3, 2, 2, 1]
+      },
+      "total": 8,
+      "equation": "3C + 2O2 -> 2CO + CO2"
+    },
+    {
+      "coefficients": {
+        "reactants": [
+          {"input": "C", "normalized": "C", "coefficient": 4},
+          {"input": "O2", "normalized": "O2", "coefficient": 3}
+        ],
+        "products": [
+          {"input": "CO", "normalized": "CO", "coefficient": 2},
+          {"input": "CO2", "normalized": "CO2", "coefficient": 2}
+        ],
+        "vector": [4, 3, 2, 2]
+      },
+      "total": 11,
+      "equation": "4C + 3O2 -> 2CO + 2CO2"
+    }
+  ]
+}
+```
+
+说明：
+
+* **唯一配平的反应**（零空间维数 1）也返回单个方案；若其最小系数超过
+  `max_coefficient`，则返回空列表、`count=0`、`truncated=false`；
+* **自由变量超过 3 个**（零空间维数 ≥ 4）时返回 `422`，错误码
+  `VARIANT_SPACE_TOO_LARGE`，`details` 中给出 `nullity` 与 `degrees_of_freedom`；
+* `truncated` 仅在符合条件的方案数严格大于 `limit` 时为 `true`；
+* `vector` 的分量顺序与 `normalized.reactants + normalized.products` 一致。
+
+### 2.3 逐元素差异 `POST /api/v1/analyze`
 
 返回两个视图：
 
@@ -132,7 +214,7 @@ curl -X POST http://localhost:8000/api/v1/analyze \
 即使反应**无法唯一配平**，`/analyze` 也返回 `200`，同时带 `raw` 视图与
 `error` 字段（`balanced_ok=false`、`balanced=null`），方便客户端展示诊断信息。
 
-### 2.3 幂等与查询
+### 2.4 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -184,6 +266,12 @@ curl -X POST .../api/v1/balance -d '{"reactants":["Ca [OH]2"," HCl"],"products":
   H⁺/OH⁻ 等物种）；
 * 维数为 1 但有零分量 → `ZERO_COEFFICIENT`；符号不一致 → `INVALID_STOICHIOMETRY`。
 
+`/balance/variants` 对 **维数 2～4（自由变量 ≤ 3）** 的情形做枚举：RREF 给出
+参数化 ``x_主元 = Σ (-rref 元素)·x_自由``，把各自由分量在 1～`max_coefficient`
+内取值（最多 30³ = 27000 个组合），用整数除法筛出主元分量也为正整数且在上界内
+的向量，再去掉最大公约数 > 1 的倍数解，按 (系数总和, 向量字典序) 排序后截取
+`limit`；维数 ≥ 4 时枚举空间过大，直接返回 `VARIANT_SPACE_TOO_LARGE`。
+
 全程使用有理数，不会出现浮点误差，大系数反应（如
 `10 K4Fe(CN)6 + 122 KMnO4 + 299 H2SO4 -> …`）也能精确求解。
 
@@ -202,6 +290,7 @@ curl -X POST .../api/v1/balance -d '{"reactants":["Ca [OH]2"," HCl"],"products":
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
 | `INVALID_STOICHIOMETRY` | 422 | 唯一解符号不一致，物种可能需要换边 |
+| `VARIANT_SPACE_TOO_LARGE` | 422 | `/balance/variants` 零空间自由变量 > 3（返回 `nullity` 与自由度） |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -223,12 +312,12 @@ curl -X POST .../api/v1/balance -d '{"reactants":["Ca [OH]2"," HCl"],"products":
 ```
 app/
   parser.py    递归下降化学式解析（元素/括号/电荷/电子）
-  balancer.py  守恒矩阵、有理数 RREF、零空间、最小正整数、守恒视图
+  balancer.py  守恒矩阵、有理数 RREF、零空间、最小正整数、变体枚举、守恒视图
   cache.py     规范化签名（SHA-256）与 LRU 幂等缓存
   service.py   业务编排与响应组装
   models.py    Pydantic 请求/响应模型
   main.py      FastAPI 路由与异常处理
-tests/         解析器、配平核心、HTTP API 共 81 个测试
+tests/         解析器、配平核心（含变体枚举）、HTTP API 共 101 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
