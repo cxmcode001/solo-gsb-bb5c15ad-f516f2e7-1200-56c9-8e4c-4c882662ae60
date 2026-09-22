@@ -2,8 +2,9 @@
 
 路由（统一前缀 /api/v1）：
 
-* ``POST /balance``  配平并返回最小正整数系数；
-* ``POST /analyze``  逐元素差异说明（配平前 + 配平后视图）；
+* ``POST /balance``          配平并返回最小正整数系数；
+* ``POST /balance/variants`` 枚举零空间内全部互质正整数配平方案；
+* ``POST /analyze``          逐元素差异说明（配平前 + 配平后视图）；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -15,8 +16,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
-from .models import AnalyzeResponse, BalanceResponse, ReactionRequest
-from .service import STATUS_CODES, get_reaction, process_analyze, process_balance
+from .models import (
+    AnalyzeResponse,
+    BalanceResponse,
+    ReactionRequest,
+    VariantRequest,
+    VariantsResponse,
+)
+from .service import (
+    STATUS_CODES,
+    get_reaction,
+    process_analyze,
+    process_balance,
+    process_variants,
+)
 
 app = FastAPI(
     title="化学反应计量平衡服务",
@@ -57,6 +70,24 @@ async def health():
 )
 async def balance(request: ReactionRequest):
     status, payload = process_balance(request.reactants, request.products)
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/balance/variants",
+    response_model=VariantsResponse,
+    tags=["配平"],
+    summary="枚举所有互质正整数配平方案（自由变量不超过 3 个）",
+    responses={400: {"description": "化学式解析失败"}, 409: {"description": "同侧重复物种"},
+               422: {"description": "无法配平 / 自由变量超过 3 个 / 请求非法"}},
+)
+async def balance_variants(request: VariantRequest):
+    status, payload = process_variants(
+        request.reactants,
+        request.products,
+        request.max_coefficient,
+        request.limit,
+    )
     return JSONResponse(status_code=status, content=payload)
 
 

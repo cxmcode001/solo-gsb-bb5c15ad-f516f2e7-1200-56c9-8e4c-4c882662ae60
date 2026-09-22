@@ -107,3 +107,40 @@ class AnalyzeResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: dict[str, Any]
+
+
+class VariantRequest(ReactionRequest):
+    """``/balance/variants`` 请求：在 ReactionRequest 之上加枚举参数。"""
+
+    max_coefficient: int = Field(
+        ...,
+        ge=2,
+        le=30,
+        description="允许的最大系数（含端点，范围 2～30）",
+    )
+    limit: int = Field(
+        ...,
+        ge=1,
+        le=100,
+        description="最多返回的配平方案数（含端点，范围 1～100）",
+    )
+
+
+class VariantItem(BaseModel):
+    coefficients: CoefficientBlock = Field(
+        description="按 reactants + products 顺序的一个互质正整数解"
+    )
+    sum: int = Field(description="该方案的系数总和（主排序键）")
+    equation: str = Field(description="该方案对应的规范化化学方程式")
+
+
+class VariantsResponse(BaseModel):
+    reaction_id: str
+    normalized: NormalizedReaction
+    max_coefficient: int
+    limit: int
+    nullity: int = Field(description="守恒矩阵零空间维数（1～3）")
+    count: int = Field(description="本次实际返回的方案数")
+    total: int = Field(description="枚举到的全部方案数（截取前）")
+    truncated: bool = Field(description="方案总数超过 limit、已截取时为 true")
+    variants: list[VariantItem]

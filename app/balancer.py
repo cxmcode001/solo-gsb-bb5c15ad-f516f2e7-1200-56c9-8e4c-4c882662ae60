@@ -8,6 +8,9 @@
   得到唯一配平；
 * 维数为 0 → 不可能守恒；维数 > 1 → 配平不唯一（自由度 ``d-1``）；
 * 维数为 1 但存在 0 分量或符号不一致 → 该反应无法成立。
+
+另外 :func:`enumerate_variants` 在零空间维数 1～3 时枚举所有
+``1..max_coefficient`` 范围内的互质正整数解，供 ``/balance/variants`` 使用。
 """
 
 from __future__ import annotations
@@ -61,6 +64,17 @@ class SolvedReaction:
         return self.coefficients[len(self.reactants) :]
 
 
+@dataclass(frozen=True)
+class VariantSet:
+    """零空间枚举结果：所有 1..max_coefficient 内的互质正整数配平。"""
+
+    reactants: tuple[Species, ...]
+    products: tuple[Species, ...]
+    coefficients: tuple[tuple[int, ...], ...]
+    elements: tuple[str, ...]
+    nullity: int
+
+
 # ---------------------------------------------------------------- 解析一侧
 def parse_side(texts: Iterable[str], side_name: str) -> tuple[Species, ...]:
     """解析一侧的化学式，去重并按规范键排序。"""
@@ -97,25 +111,12 @@ def solve_reaction(
         raise BalanceError("INVALID_REQUEST", "物种总数不能超过 100")
 
     species = reactants + products
+    n_cols = len(species)
 
     element_set = sorted(
         {el for sp in species for el in sp.formula.composition}
     )
-    # 电子没有任何元素，需要确保矩阵至少包含电荷行
-    n_cols = len(species)
-    matrix: list[list[Fraction]] = []
-    for element in element_set:
-        row = [Fraction(sp.formula.composition.get(element, 0)) for sp in species]
-        # 守恒式（左侧原子数 = 右侧原子数）写成 A x = 0：反应物列取正、
-        # 生成物列取负。物理上成立的正系数解在该约定下整体同号。
-        for j in range(len(reactants), n_cols):
-            row[j] = -row[j]
-        matrix.append(row)
-    # 电荷守恒行
-    charge_row = [Fraction(sp.formula.charge) for sp in species]
-    for j in range(len(reactants), n_cols):
-        charge_row[j] = -charge_row[j]
-    matrix.append(charge_row)
+    matrix = _build_conservation_matrix(reactants, products, element_set)
 
     basis = _null_space(matrix)
 
@@ -202,7 +203,175 @@ def solve_reaction(
     )
 
 
+# ------------------------------------------------------------ 多解枚举
+MAX_VARIANT_FREE_VARIABLES = 3
+VARIANT_SPACE_TOO_LARGE = "VARIANT_SPACE_TOO_LARGE"
+
+
+def enumerate_variants(
+    reactant_texts: Iterable[str],
+    product_texts: Iterable[str],
+    max_coefficient: int,
+) -> VariantSet:
+    """枚举零空间中所有分量落在 ``1..max_coefficient`` 的互质正整数解。
+
+    零空间维数（自由变量数）为 0 时抛出 ``IMPOSSIBLE_BALANCE``；超过
+    :data:`MAX_VARIANT_FREE_VARIABLES` 时抛出 ``VARIANT_SPACE_TOO_LARGE``。
+    维数 1～3 时，在 ``1..max_coefficient`` 内对自由变量做精确有理数枚举
+    （自由分量本身也必须是正系数），过滤掉非整数、超界、最大公约数大于 1
+    的向量，结果按系数总和与向量字典序排序。不存在正整数解时返回空集合。
+    """
+    reactants = parse_side(reactant_texts, "反应物")
+    products = parse_side(product_texts, "生成物")
+    return enumerate_variants_parsed(reactants, products, max_coefficient)
+
+
+def enumerate_variants_parsed(
+    reactants: tuple[Species, ...],
+    products: tuple[Species, ...],
+    max_coefficient: int,
+) -> VariantSet:
+    """与 :func:`enumerate_variants` 相同，但入参为已解析、去重排序的物种。"""
+    if not reactants:
+        raise BalanceError("INVALID_REQUEST", "反应物列表不能为空")
+    if not products:
+        raise BalanceError("INVALID_REQUEST", "生成物列表不能为空")
+    if len(reactants) + len(products) > 100:
+        raise BalanceError("INVALID_REQUEST", "物种总数不能超过 100")
+
+    species = reactants + products
+    element_set = sorted(
+        {el for sp in species for el in sp.formula.composition}
+    )
+    matrix = _build_conservation_matrix(reactants, products, element_set)
+    basis = _null_space(matrix)
+    nullity = len(basis)
+
+    if nullity == 0:
+        raise BalanceError(
+            "IMPOSSIBLE_BALANCE",
+            "元素或电荷守恒方程无解：该反应在给定反应物与生成物下无法配平",
+            elements=element_set,
+        )
+    if nullity > MAX_VARIANT_FREE_VARIABLES:
+        raise BalanceError(
+            VARIANT_SPACE_TOO_LARGE,
+            f"零空间维数为 {nullity}（{nullity - 1} 个自由度），"
+            f"超过变体枚举上限 {MAX_VARIANT_FREE_VARIABLES}，"
+            "请补充缺失物种（如电子 e-、H2O、H+ / OH-）后重试。",
+            nullity=nullity,
+            max_free_variables=MAX_VARIANT_FREE_VARIABLES,
+            elements=element_set,
+        )
+
+    vectors = _enumerate_positive_primitive(basis, nullity, max_coefficient)
+    vectors.sort(key=lambda vec: (sum(vec), vec))
+    return VariantSet(
+        reactants=reactants,
+        products=products,
+        coefficients=tuple(tuple(vec) for vec in vectors),
+        elements=tuple(element_set),
+        nullity=nullity,
+    )
+
+
+def _enumerate_positive_primitive(
+    basis: list[list[Fraction]], nullity: int, max_coefficient: int
+) -> list[list[int]]:
+    """对 1～3 个自由变量枚举范围内的互质正整数解。
+
+    RREF 基的第 k 个向量在第 k 个自由列上为 1、其余自由列为 0，因此令自由
+    分量直接取 ``t_k in 1..max_coefficient``（正解的自由分量本身就是正系数），
+    主元分量按 ``x_i = Σ b_k[i]·t_k`` 精确计算：全部为 1..max_coefficient 的
+    整数且整体 gcd 为 1 才接受。每个本原正整数解恰有一个本原表示，gcd 过滤
+    同时完成去重。自由值至多 ``30³`` 组。
+
+    每个主元行的各基系数预先通分（分母 LCM），枚举热循环里只有整数乘加，
+    并用“分子是否被分母整除”判定整数，逐行提前剪枝。
+    """
+    n = len(basis[0])
+    # RREF 构造中第 k 个基向量在第 k 个自由列上为 1、其余自由列为 0
+    free_positions = [
+        next(
+            i
+            for i in range(n)
+            if basis[k][i] == 1
+            and all(j == k or basis[j][i] == 0 for j in range(nullity))
+        )
+        for k in range(nullity)
+    ]
+    pivot_positions = [i for i in range(n) if i not in free_positions]
+
+    # (主元列, 分母 LCM, 通分后的整数权重)
+    pivot_rows: list[tuple[int, int, tuple[int, ...]]] = []
+    for i in pivot_positions:
+        denom = lcm(*(basis[k][i].denominator for k in range(nullity)))
+        weights = tuple(int(basis[k][i] * denom) for k in range(nullity))
+        pivot_rows.append((i, denom, weights))
+
+    results: list[list[int]] = []
+    values = range(1, max_coefficient + 1)
+
+    def accept(t: tuple[int, ...]) -> None:
+        vec = [0] * n
+        for pos, tk in zip(free_positions, t):
+            vec[pos] = tk
+        for i, denom, weights in pivot_rows:
+            numerator = sum(w * tk for w, tk in zip(weights, t))
+            if numerator % denom:
+                return
+            value = numerator // denom
+            if value <= 0 or value > max_coefficient:
+                return
+            vec[i] = value
+        common = 0
+        for v in vec:
+            common = gcd(common, v)
+        if common != 1:
+            return
+        results.append(vec)
+
+    if nullity == 1:
+        for t0 in values:
+            accept((t0,))
+    elif nullity == 2:
+        for t0 in values:
+            for t1 in values:
+                accept((t0, t1))
+    else:
+        for t0 in values:
+            for t1 in values:
+                for t2 in values:
+                    accept((t0, t1, t2))
+    return results
+
+
 # ---------------------------------------------------------------- 线性代数
+def _build_conservation_matrix(
+    reactants: tuple[Species, ...],
+    products: tuple[Species, ...],
+    element_set: list[str],
+) -> list[list[Fraction]]:
+    """组装元素守恒 + 总电荷守恒的齐次方程组 A x = 0。
+
+    守恒式（左侧原子数/电荷 = 右侧）写成齐次式时反应物列取正、生成物列取负；
+    电子没有任何元素，电荷行保证矩阵至少有一行。
+    """
+    species = reactants + products
+    n_cols = len(species)
+    matrix: list[list[Fraction]] = []
+    for element in element_set:
+        row = [Fraction(sp.formula.composition.get(element, 0)) for sp in species]
+        for j in range(len(reactants), n_cols):
+            row[j] = -row[j]
+        matrix.append(row)
+    charge_row = [Fraction(sp.formula.charge) for sp in species]
+    for j in range(len(reactants), n_cols):
+        charge_row[j] = -charge_row[j]
+    matrix.append(charge_row)
+    return matrix
+
+
 def _rref(matrix: list[list[Fraction]]) -> tuple[list[list[Fraction]], list[int]]:
     """对有理数矩阵做高斯-若尔当消元，返回 (RREF, 主元列)。"""
     m = [row[:] for row in matrix]

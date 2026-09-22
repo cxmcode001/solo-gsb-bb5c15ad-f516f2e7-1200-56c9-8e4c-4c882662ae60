@@ -5,14 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 from .balancer import (
+    VARIANT_SPACE_TOO_LARGE,
     BalanceError,
     Species,
     build_balanced_view,
     build_raw_view,
+    enumerate_variants_parsed,
     parse_side,
     solve_reaction,
 )
-from .cache import ReactionRecord, build_signature, cache, species_key
+from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .parser import FormulaError
 
 
@@ -26,6 +28,7 @@ STATUS_CODES = {
     "ZERO_COEFFICIENT": 422,
     "INVALID_STOICHIOMETRY": 422,
     "CHARGE_NOT_CONSERVED": 422,
+    VARIANT_SPACE_TOO_LARGE: 422,
 }
 
 
@@ -324,3 +327,69 @@ def _record_species(record: ReactionRecord, attr: str) -> list[Species]:
         )
         for item in getattr(record, attr)
     ]
+
+
+# ------------------------------------------------------------ 多变体枚举
+def process_variants(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    max_coefficient: int,
+    limit: int,
+) -> tuple[int, dict[str, Any]]:
+    """枚举配平变体，返回 (http_status, payload)。结果不写幂等缓存。"""
+    try:
+        reactants, products = _parse_all(reactant_texts, product_texts)
+    except BalanceError as exc:
+        # 解析 / 去重阶段失败：沿用与 /balance 一致的退化签名生成 ID
+        reaction_id = reaction_id_for(
+            _text_signature(reactant_texts, product_texts)
+        )
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+            "reaction_id": reaction_id,
+        }
+
+    try:
+        variant_set = enumerate_variants_parsed(reactants, products, max_coefficient)
+    except BalanceError as exc:
+        reaction_id = reaction_id_for(build_signature(reactants, products))
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+            "reaction_id": reaction_id,
+        }
+
+    signature = build_signature(reactants, products)
+    reaction_id = reaction_id_for(signature)
+
+    total = len(variant_set.coefficients)
+    page = variant_set.coefficients[:limit]
+
+    items: list[dict[str, Any]] = []
+    for vec in page:
+        coefficient_map = {
+            species_key(sp): coef
+            for sp, coef in zip((*reactants, *products), vec)
+        }
+        items.append(
+            {
+                "coefficients": {
+                    "reactants": _species_coefficients(reactants, coefficient_map),
+                    "products": _species_coefficients(products, coefficient_map),
+                    "vector": list(vec),
+                },
+                "sum": sum(vec),
+                "equation": _equation(reactants, products, coefficient_map),
+            }
+        )
+
+    return 200, {
+        "reaction_id": reaction_id,
+        "normalized": _normalized_block(reactants, products, None),
+        "max_coefficient": max_coefficient,
+        "limit": limit,
+        "nullity": variant_set.nullity,
+        "count": len(page),
+        "total": total,
+        "truncated": total > limit,
+        "variants": items,
+    }
